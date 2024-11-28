@@ -1,0 +1,5 @@
+*.bin
+*.pickle
+*.sqlite3
+*.csv
+*.pyc
