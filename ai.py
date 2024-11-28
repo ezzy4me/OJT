@@ -1,164 +1,162 @@
-import pandas as pd
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import PromptTemplate
-from langchain.schema import HumanMessage
 import os
 import argparse
+from ec2_statistics import load_ec2_data, generate_statistics
+from langchain_community.document_loaders import PDFPlumberLoader
+from langchain_community.vectorstores import Chroma
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai.embeddings import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_core.output_parsers import StrOutputParser
+from operator import itemgetter
 
-# OpenAI API 키 환경 변수에서 로드
+# Load the OpenAI API key from environment variables
 openai_key = os.getenv("OPENAI_API_KEY")
 
-# argparse를 사용하여 사용자 입력을 처리
+# Parse arguments using argparse
 def parse_arguments():
     parse_arguments = argparse.ArgumentParser("DEMO: ChatGPT를 사용한 FAQ 시스템")
-    parse_arguments.add_argument("--infra-file", type=str, required=True, help="자동으로 metrics_data 폴더에서 EC2 데이터를 로드할 수 있도록 .csv 파일 경로를 지정했음.")
+    parse_arguments.add_argument("--infra-file", type=str, default='', help="자동으로 metrics_data 폴더에서 EC2 데이터를 로드할 수 있도록 .csv 파일 경로를 지정했음.")
     parse_arguments.add_argument("--openai-model", type=str, default="gpt-4o-mini", help="OpenAI 모델 이름 (기본값: gpt-4o-mini)")
+    parse_arguments.add_argument("--pdf-file", type=str, default='/pdf/AmazonElasticComputeCloudDevGuide.pdf' ,help="PDF 파일 경로")
     return parse_arguments.parse_args()
 
-def load_ec2_data(file_path):
-    """
-    Load and process EC2 data from a CSV file.
-    """
-    folder_path = os.getcwd() + '/metrics_data'
-    csv_files = [file for file in os.listdir(folder_path) if file.endswith('.csv')]
 
-    # 각각의 .csv 파일을 읽어서 DataFrame으로 변환
-    dataframes = {}
-    for file in csv_files:
-        file_path = os.path.join(folder_path, file)
-        df = pd.read_csv(file_path)
-        dataframes[file] = df
+# Load and split PDF into chunks
+def load_pdf_and_split(file_path):
+    loader = PDFPlumberLoader(file_path)
+    pdf_data = loader.load()
+    print(f"Loading PDF file from {file_path}...")
+    print(f"Number of pages: {len(pdf_data)}")
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100, separators=["\n"])
+    split_data = text_splitter.split_documents(pdf_data)
+    print(f"Split PDF into {len(split_data)} chunks.")
+    return split_data
 
-    # dataframes 정렬
-    for file_name, df in dataframes.items():
-        df['Timestamp'] = pd.to_datetime(df['Timestamp'])
-        df.set_index('Timestamp', inplace=True)
-        dataframes[file_name] = df
-    
-    # merge dataframes
-    # it needs to be modified if there are multiple csv files
-    print(dataframes.keys())
-    combined_data = pd.merge(
-        dataframes['CPUUtilization_AWSEC2_ec2_metrics.csv'][['Value']],
-        dataframes['mem_used_percent_CWAgent_ec2_metrics.csv'][['Value']],
-        left_index=True,
-        right_index=True,
-        how='outer',
-        suffixes=('_CPU', '_Memory')
-    )
+# Setup the vector database
+def setup_embeddings_and_chroma(pdf_file):
+    embeddings = OpenAIEmbeddings(openai_api_key=openai_key)
+    collection_name = "ec2_document"
+    persist_dir = os.path.join(os.getcwd(), "ec2_document_embedding")
+    split_data = load_pdf_and_split(pdf_file)
 
-    return combined_data
+    if not os.path.exists(persist_dir):
+        os.makedirs(persist_dir)
+    vecDB = Chroma.from_documents(split_data, embeddings, collection_name=collection_name, persist_directory=persist_dir)
+    vecDB.persist()
+    print("Vector database initialized and persisted.")
+    return vecDB.as_retriever(search_type='similarity', search_kwargs={'k': 5})
 
-def generate_statistics(data):
+def format_prompt(ec2_stats, question):
     """
-    Generate descriptive statistics for a DataFrame.
-    """
-    summary_dct = {}
-    for infra, _ in data.items():
-        stats = data[infra].describe()  # 주요 통계 정보 생성
-        summary_dct[f"{infra}에 대한 통계 정보:"] = (
-            f"평균: {stats['mean']:.3f}%, "
-            f"최대값: {stats['max']:.3f}%, "
-            f"최소값: {stats['min']:.3f}%, "
-            f"표준편차: {stats['std']:.3f}, "
-            f"1사분위: {stats['25%']:.3f}%, "
-            f"중앙값: {stats['50%']:.3f}%",
-            f"3사분위: {stats['75%']:.3f}%"
-            )
-        
-    return summary_dct
-
-def generate_prompt(ec2_stats, question):
-    """
-    Generate a prompt dynamically based on EC2 stats and a user question.
+    EC2 통계와 질문을 기반으로 PromptTemplate 객체와 데이터를 반환다.
     
     Args:
-        ec2_stats (dict): A dictionary where keys are resource names and values are tuples of stats.
-        question (str): The question or task to ask ChatGPT.
-    
+        ec2_stats (dict): EC2 인스턴스의 리소스 사용 데이터.
+        question (str): 사용자 질문.
+
     Returns:
-        str: The formatted prompt.
+        tuple: (PromptTemplate 객체, dict 포맷팅 데이터)
     """
-    # Dynamically generate the resource stats section
-    resource_stats = "\n".join(
-        f"- {key} {' '.join(value)}" for key, value in ec2_stats.items()
-    )
-    
-    # Define the template
-    TEMPLATE = """
-        당신은 AWS EC2 인스턴스의 전문가입니다. 아래는 EC2 인스턴스의 리소스 사용 데이터입니다.
-
-        {resource_stats}
-
-        주어진 데이터를 바탕으로 주요 트렌드와 이상치를 요약하고, 필요한 경우 최적화 제안을 추가하세요.
-
-        질문: {question}
-    """
-    return TEMPLATE.format(resource_stats=resource_stats, question=question)
-
-
-def ask_gpt(prompt, openai_key=openai_key):
-    """
-    Send a prompt to ChatGPT and return its response.
-
-    Args:
-        prompt (str): The prompt to send to ChatGPT.
-        openai_key (str): OpenAI API key for authentication.
-    
-    Returns:
-        str: ChatGPT's response.
-    """
-    # Initialize the ChatOpenAI model
-    llm = ChatOpenAI(
-        openai_api_key=openai_key,
-        model_name="gpt-4",
-        temperature=0.5,
+    # 리소스 통계를 문자열로 변환
+    resource_stats = (
+        "\n".join(f"- {key}: {' '.join(value)}" for key, value in ec2_stats.items())
+        if ec2_stats else "No resource statistics available."
     )
 
-    # Send the prompt as a HumanMessage
-    response = llm.invoke([HumanMessage(content=prompt)])
+    # 기본값 설정
+    chat_history = "No chat history available."
+    context = "No context available."
+    question = question
 
-    return response.content
+    # PromptTemplate 생성
+    prompt_template = PromptTemplate.from_template(
+        template=f"""
+            당신은 AWS EC2 인스턴스의 전문가입니다. 아래는 EC2 인스턴스의 리소스 사용 데이터입니다.
+            {resource_stats}
 
-def process_ec2_question(file_path, question):
-    """
-    Process an EC2-related question by generating statistics, creating a prompt, and asking GPT.
-    """
-    # Load EC2 data
-    ec2_data = load_ec2_data(file_path)
+            Previous Chat History:
+            {chat_history}
 
-    # Generate statistics
-    ec2_stats = generate_statistics(ec2_data)
+            Question: 
+            {question} 
 
-    # Create prompt
-    prompt = generate_prompt(ec2_stats, question)
+            Context: 
+            {context}
 
-    # Get answer from GPT
-    answer = ask_gpt(prompt)
-    return answer
+            Answer: 
+        """
+    )
 
-# Step 3: FAQ QnA 시스템
+    return prompt_template
+
+# Setup the conversational retrieval chain
+def setup_conversational_chain(retriever, prompt):
+    llm = ChatOpenAI(openai_api_key=openai_key, model_name="gpt-4o-mini", temperature=0.7)
+    # prompt = PromptTemplate(template="질문: {question}\n답변:", language="ko")
+    chain = (
+        {   
+            "context": itemgetter("question") | retriever,
+            "question": itemgetter("question"),
+            "chat_history": itemgetter("chat_history"),
+        }
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+    return chain
+
+# 세션 ID를 기반으로 세션 기록을 가져오는 함수
+def get_session_history(session_ids):
+    # 세션 기록을 저장할 딕셔너리
+    store = {}
+    print(f"[대화 세션ID]: {session_ids}")
+    if session_ids not in store:  # 세션 ID가 store에 없는 경우
+        # 새로운 ChatMessageHistory 객체를 생성하여 store에 저장
+        store[session_ids] = ChatMessageHistory()
+    return store[session_ids]  # 해당 세션 ID에 대한 세션 기록 반환
+
+# Main function with user input
 def main():
-    # Parse arguments
     args = parse_arguments()
-
+    print()
     # Load EC2 data
-    file_path = args.infra_file
-    print("Loading EC2 data...")
-    ec2_data = load_ec2_data(file_path)
+    ec2_data_file = os.getcwd()
+    pdf_file = os.getcwd() + args.pdf_file
+    print(f"Loading EC2 data from {ec2_data_file}...")
+    ec2_data = load_ec2_data(ec2_data_file)
 
     # Generate statistics
-    print("Generating statistics...")
+    print("Generating EC2 statistics...")
     ec2_stats = generate_statistics(ec2_data)
-    print("Statistics:")
-    print(ec2_stats)
+    print("Statistics generated.")
 
-    # Ask a question to the FAQ system
-    print("Asking FAQ system...")
-    question = "현재 인프라 상황에 대해 말해주고 조치 방안을 제안해주세요."
-    faq_response = process_ec2_question(file_path, question)
-    print("FAQ Answer:")
-    print(faq_response)
+    # Setup PDF retriever
+    print("Setting up retriever from PDF...")
+    retriever = setup_embeddings_and_chroma(pdf_file)
+
+    # Setup conversational chain
+    prompt_template = format_prompt(ec2_stats, "주어진 데이터를 바탕으로 주요 트렌드와 이상치를 요약하고, 필요한 경우 최적화 제안을 추가하세요.")
+
+    chatQA = setup_conversational_chain(retriever, prompt=prompt_template)
+
+    # 대화를 기록하는 RAG 체인 생성 
+    rag_with_history = RunnableWithMessageHistory(
+        chatQA,
+        get_session_history,  # 세션 기록을 가져오는 함수
+        input_messages_key="question",  # 사용자의 질문이 템플릿 변수에 들어갈 key
+        history_messages_key="chat_history",  # 기록 메시지의 키
+    )
+
+    # RAG Chain 실행
+    re_1 = rag_with_history.invoke(
+        {"question": "aws에서 제공하는 컴퓨팅 instant의 이름은?"},  # 메시지 리스트 전달
+        config={"configurable": {"session_id": "rag123"}},
+    )
+
+    print("Debug: Invoke result:", re_1)
 
 if __name__ == "__main__":
     main()
